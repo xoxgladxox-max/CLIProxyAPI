@@ -92,7 +92,32 @@ type Auth struct {
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
-	indexAssigned bool `json:"-"`
+	Success int64 `json:"-"`
+	Failed  int64 `json:"-"`
+
+	recentRequests recentRequestRing `json:"-"`
+	indexAssigned  bool              `json:"-"`
+}
+
+const (
+	recentRequestBucketSeconds int64 = 10 * 60
+	recentRequestBucketCount         = 20
+)
+
+type recentRequestBucket struct {
+	bucketID int64
+	success  int64
+	failed   int64
+}
+
+type recentRequestRing struct {
+	buckets [recentRequestBucketCount]recentRequestBucket
+}
+
+type RecentRequestBucket struct {
+	Time    string `json:"time"`
+	Success int64  `json:"success"`
+	Failed  int64  `json:"failed"`
 }
 
 // QuotaState contains limiter tracking data for a credential.
@@ -123,6 +148,70 @@ type ModelState struct {
 	Quota QuotaState `json:"quota"`
 	// UpdatedAt tracks the last update timestamp for this model state.
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func recentRequestBucketID(now time.Time) int64 {
+	if now.IsZero() {
+		return 0
+	}
+	return now.Unix() / recentRequestBucketSeconds
+}
+
+func recentRequestBucketIndex(bucketID int64) int {
+	mod := bucketID % int64(recentRequestBucketCount)
+	if mod < 0 {
+		mod += int64(recentRequestBucketCount)
+	}
+	return int(mod)
+}
+
+func formatRecentRequestBucketLabel(bucketID int64) string {
+	start := time.Unix(bucketID*recentRequestBucketSeconds, 0).In(time.Local)
+	end := start.Add(time.Duration(recentRequestBucketSeconds) * time.Second)
+	return start.Format("15:04") + "-" + end.Format("15:04")
+}
+
+func (a *Auth) recordRecentRequest(now time.Time, success bool) {
+	if a == nil {
+		return
+	}
+	bucketID := recentRequestBucketID(now)
+	idx := recentRequestBucketIndex(bucketID)
+	bucket := &a.recentRequests.buckets[idx]
+	if bucket.bucketID != bucketID {
+		bucket.bucketID = bucketID
+		bucket.success = 0
+		bucket.failed = 0
+	}
+	if success {
+		bucket.success++
+		return
+	}
+	bucket.failed++
+}
+
+func (a *Auth) RecentRequestsSnapshot(now time.Time) []RecentRequestBucket {
+	out := make([]RecentRequestBucket, 0, recentRequestBucketCount)
+	if a == nil {
+		return out
+	}
+
+	currentBucketID := recentRequestBucketID(now)
+	for i := recentRequestBucketCount - 1; i >= 0; i-- {
+		bucketID := currentBucketID - int64(i)
+		idx := recentRequestBucketIndex(bucketID)
+		bucket := a.recentRequests.buckets[idx]
+		entry := RecentRequestBucket{
+			Time: formatRecentRequestBucketLabel(bucketID),
+		}
+		if bucket.bucketID == bucketID {
+			entry.Success = bucket.success
+			entry.Failed = bucket.failed
+		}
+		out = append(out, entry)
+	}
+
+	return out
 }
 
 // Clone shallow copies the Auth structure, duplicating maps to avoid accidental mutation.
@@ -162,7 +251,60 @@ func stableAuthIndex(seed string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// EnsureIndex returns a stable index derived from the auth file name or API key.
+func (a *Auth) indexSeed() string {
+	if a == nil {
+		return ""
+	}
+
+	if fileName := strings.TrimSpace(a.FileName); fileName != "" {
+		return "file:" + fileName
+	}
+
+	providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
+	compatName := ""
+	baseURL := ""
+	apiKey := ""
+	source := ""
+	if a.Attributes != nil {
+		if value := strings.TrimSpace(a.Attributes["provider_key"]); value != "" {
+			providerKey = strings.ToLower(value)
+		}
+		compatName = strings.ToLower(strings.TrimSpace(a.Attributes["compat_name"]))
+		baseURL = strings.TrimSpace(a.Attributes["base_url"])
+		apiKey = strings.TrimSpace(a.Attributes["api_key"])
+		source = strings.TrimSpace(a.Attributes["source"])
+	}
+
+	proxyURL := strings.TrimSpace(a.ProxyURL)
+	hasCredentialIdentity := compatName != "" || baseURL != "" || proxyURL != "" || apiKey != "" || source != ""
+	if providerKey != "" && hasCredentialIdentity {
+		parts := []string{"provider=" + providerKey}
+		if compatName != "" {
+			parts = append(parts, "compat="+compatName)
+		}
+		if baseURL != "" {
+			parts = append(parts, "base="+baseURL)
+		}
+		if proxyURL != "" {
+			parts = append(parts, "proxy="+proxyURL)
+		}
+		if apiKey != "" {
+			parts = append(parts, "api_key="+apiKey)
+		}
+		if source != "" {
+			parts = append(parts, "source="+source)
+		}
+		return "config:" + strings.Join(parts, "\x00")
+	}
+
+	if id := strings.TrimSpace(a.ID); id != "" {
+		return "id:" + id
+	}
+
+	return ""
+}
+
+// EnsureIndex returns a stable index derived from the auth file name or credential identity.
 func (a *Auth) EnsureIndex() string {
 	if a == nil {
 		return ""
@@ -171,20 +313,9 @@ func (a *Auth) EnsureIndex() string {
 		return a.Index
 	}
 
-	seed := strings.TrimSpace(a.FileName)
-	if seed != "" {
-		seed = "file:" + seed
-	} else if a.Attributes != nil {
-		if apiKey := strings.TrimSpace(a.Attributes["api_key"]); apiKey != "" {
-			seed = "api_key:" + apiKey
-		}
-	}
+	seed := a.indexSeed()
 	if seed == "" {
-		if id := strings.TrimSpace(a.ID); id != "" {
-			seed = "id:" + id
-		} else {
-			return ""
-		}
+		return ""
 	}
 
 	idx := stableAuthIndex(seed)
@@ -360,18 +491,6 @@ func (a *Auth) AccountInfo() (string, string) {
 					}
 				}
 				return "oauth", email
-			}
-		}
-	}
-
-	// For iFlow provider, prioritize OAuth type if email is present
-	if strings.ToLower(a.Provider) == "iflow" {
-		if a.Metadata != nil {
-			if email, ok := a.Metadata["email"].(string); ok {
-				email = strings.TrimSpace(email)
-				if email != "" {
-					return "oauth", email
-				}
 			}
 		}
 	}

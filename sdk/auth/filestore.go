@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -253,18 +254,22 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
 	}
+	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
 }
 
 func (s *FileTokenStore) idFor(path, baseDir string) string {
-	if baseDir == "" {
-		return path
+	id := path
+	if baseDir != "" {
+		if rel, errRel := filepath.Rel(baseDir, path); errRel == nil && rel != "" {
+			id = rel
+		}
 	}
-	rel, err := filepath.Rel(baseDir, path)
-	if err != nil {
-		return path
+	// On Windows, normalize ID casing to avoid duplicate auth entries caused by case-insensitive paths.
+	if runtime.GOOS == "windows" {
+		id = strings.ToLower(id)
 	}
-	return rel
+	return id
 }
 
 func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error) {
